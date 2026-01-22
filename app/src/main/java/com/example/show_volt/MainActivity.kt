@@ -44,6 +44,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -229,7 +230,7 @@ class MainViewModel : ViewModel() {
 
     private fun onDataReceived(data: String) {
         try {
-            val parts = data.split(",").associate { 
+            val parts = data.split(",").associate {
                 val pair = it.split("=")
                 if (pair.size == 2) pair[0] to pair[1] else pair[0] to ""
             }
@@ -237,11 +238,13 @@ class MainViewModel : ViewModel() {
             val vin = parts["VIN"]?.toFloatOrNull()
 
             if (id != null && vin != null) {
-                viewModelScope.launch {
-                    val currentDevices = _espDevices.value
+                // Use the atomic `update` function to prevent race conditions
+                // when data from multiple devices arrives concurrently.
+                _espDevices.update { currentDevices ->
                     val currentState = currentDevices[id] ?: DeviceState()
                     val newState = processDeviceUpdate(currentState, vin)
-                    _espDevices.value = currentDevices + (id to newState)
+                    // Return the new map with the updated state for the device.
+                    currentDevices + (id to newState)
                 }
             }
         } catch (e: Exception) {
