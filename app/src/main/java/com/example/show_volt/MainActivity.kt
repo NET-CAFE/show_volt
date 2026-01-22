@@ -19,7 +19,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.ParcelUuid
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -102,11 +101,22 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-data class EspDeviceState(val averageVoltage: Float = 0f, val lastTime: Float = 0f)
+// Data class to hold the state and results for each device
+data class DeviceState(
+    // State for an ongoing session
+    val isSessionActive: Boolean = false,
+    val sessionStartTime: Long = 0L,
+    val voltageReadings: List<Float> = emptyList(),
+
+    // Results of the last completed session
+    val lastAverageVoltage: Float = 0f,
+    val lastSessionDuration: Float = 0f
+)
+
 
 @SuppressLint("MissingPermission")
 class MainViewModel : ViewModel() {
-    private val _espDevices = MutableStateFlow<Map<Int, EspDeviceState>>(emptyMap())
+    private val _espDevices = MutableStateFlow<Map<Int, DeviceState>>(emptyMap())
     val espDevices = _espDevices.asStateFlow()
 
     private val _connectionState = MutableStateFlow("Disconnected")
@@ -114,8 +124,11 @@ class MainViewModel : ViewModel() {
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var bleScanner: BluetoothLeScanner? = null
+    private var applicationContext: Context? = null
+
 
     fun startScan(context: Context) {
+        applicationContext = context.applicationContext
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val bluetoothAdapter = bluetoothManager.adapter
         bleScanner = bluetoothAdapter.bluetoothLeScanner
@@ -140,13 +153,18 @@ class MainViewModel : ViewModel() {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             _connectionState.value = "Device Found, Connecting..."
-            result.device.connectGatt(null, false, gattCallback)
-            // Stop scanning once the device is found
+            applicationContext?.let {
+                result.device.connectGatt(it, false, gattCallback)
+            } ?: run {
+                 _connectionState.value = "Error: Context not available"
+                 Log.e("BLE", "Cannot connect, context is null")
+            }
             bleScanner?.stopScan(this)
         }
 
         override fun onScanFailed(errorCode: Int) {
             _connectionState.value = "Scan Failed: Code $errorCode"
+            Log.e("BLE", "Scan Failed with code: $errorCode")
         }
     }
 
@@ -167,6 +185,7 @@ class MainViewModel : ViewModel() {
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d("BLE", "Services Discovered")
                 val service = gatt.getService(SERVICE_UUID)
                 val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
                 if (characteristic != null) {
@@ -174,15 +193,21 @@ class MainViewModel : ViewModel() {
                     val descriptor = characteristic.getDescriptor(CCCD_UUID)
                     descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     gatt.writeDescriptor(descriptor)
-                    viewModelScope.launch { _connectionState.value = "Listening for data..." }
+                    Log.d("BLE", "Enabling notifications...")
+                } else {
+                     Log.e("BLE", "Characteristic not found")
                 }
+            } else {
+                Log.w("BLE", "onServicesDiscovered received: $status")
             }
         }
 
-        @Deprecated("Used for older API levels")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                onCharacteristicChanged(gatt, characteristic, characteristic.value)
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                 Log.d("BLE", "Descriptor write successful. Now listening for data.")
+                 viewModelScope.launch { _connectionState.value = "Listening for data..." }
+            } else {
+                 Log.e("BLE", "Descriptor write failed: $status")
             }
         }
 
@@ -193,21 +218,30 @@ class MainViewModel : ViewModel() {
                 onDataReceived(dataString)
             }
         }
+        
+        @Deprecated("Used for older API levels")
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                onCharacteristicChanged(gatt, characteristic, characteristic.value)
+            }
+        }
     }
 
     private fun onDataReceived(data: String) {
-        // "ID=1,VIN=11.2,TIME=123.4"
         try {
-            val parts = data.split(",").associate { val (k, v) = it.split("="); k to v }
+            val parts = data.split(",").associate { 
+                val pair = it.split("=")
+                if (pair.size == 2) pair[0] to pair[1] else pair[0] to ""
+            }
             val id = parts["ID"]?.toIntOrNull()
             val vin = parts["VIN"]?.toFloatOrNull()
-            val time = parts["TIME"]?.toFloatOrNull()
 
-            if (id != null && vin != null && time != null) {
+            if (id != null && vin != null) {
                 viewModelScope.launch {
-                    _espDevices.value = _espDevices.value.toMutableMap().apply {
-                        this[id] = EspDeviceState(vin, time)
-                    }
+                    val currentDevices = _espDevices.value
+                    val currentState = currentDevices[id] ?: DeviceState()
+                    val newState = processDeviceUpdate(currentState, vin)
+                    _espDevices.value = currentDevices + (id to newState)
                 }
             }
         } catch (e: Exception) {
@@ -215,10 +249,58 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    private fun processDeviceUpdate(currentState: DeviceState, newVoltage: Float): DeviceState {
+        val VOLTAGE_THRESHOLD = 0.5f
+
+        // Case 1: Voltage is high (session is starting or ongoing)
+        if (newVoltage >= VOLTAGE_THRESHOLD) {
+            return if (!currentState.isSessionActive) {
+                // Session is starting now
+                currentState.copy(
+                    isSessionActive = true,
+                    sessionStartTime = System.currentTimeMillis(),
+                    voltageReadings = listOf(newVoltage)
+                )
+            } else {
+                // Session is ongoing, add new voltage reading
+                currentState.copy(
+                    voltageReadings = currentState.voltageReadings + newVoltage
+                )
+            }
+        }
+        // Case 2: Voltage is low (session is ending or already ended)
+        else {
+            return if (currentState.isSessionActive) {
+                // Session was active, so it's ending now. Time to calculate.
+                val durationMillis = System.currentTimeMillis() - currentState.sessionStartTime
+                val averageVoltage = if (currentState.voltageReadings.isNotEmpty()) {
+                    val readings = currentState.voltageReadings
+                    // If there are 3 or more readings, discard the first and last ones.
+                    if (readings.size >= 3) {
+                        readings.drop(1).dropLast(1).average().toFloat()
+                    } else {
+                        // Otherwise, average all available readings.
+                        readings.average().toFloat()
+                    }
+                } else {
+                    0f // No readings in the session.
+                }
+                // Return a new state representing the completed session
+                currentState.copy(
+                    isSessionActive = false,
+                    lastAverageVoltage = averageVoltage,
+                    lastSessionDuration = durationMillis / 1000.0f,
+                    voltageReadings = emptyList() // Clear readings for next session
+                )
+            } else {
+                // Session was already ended, no change needed
+                currentState
+            }
+        }
+    }
+
     fun disconnectAndClose() {
         bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
-        bluetoothGatt = null
     }
 
     override fun onCleared() {
@@ -233,6 +315,19 @@ fun EspDataScreen(viewModel: MainViewModel) {
     val connectionState by viewModel.connectionState.collectAsState()
     val context = LocalContext.current
 
+    EspDataScreenContent(
+        espDevices = espDevices,
+        connectionState = connectionState,
+        onStartScan = { viewModel.startScan(context) }
+    )
+}
+
+@Composable
+fun EspDataScreenContent(
+    espDevices: Map<Int, DeviceState>,
+    connectionState: String,
+    onStartScan: () -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -245,8 +340,8 @@ fun EspDataScreen(viewModel: MainViewModel) {
 
         (1..5).forEach { id ->
             val deviceState = espDevices[id]
-            val text = if (deviceState != null) {
-                "ESP-%d: %.2f V, %.2f s".format(id, deviceState.averageVoltage, deviceState.lastTime)
+            val text = if (deviceState != null && deviceState.lastAverageVoltage > 0) {
+                "ESP-%d: %.2f V, %.2f s".format(id, deviceState.lastAverageVoltage, deviceState.lastSessionDuration)
             } else {
                 "ESP-%d: -- V, -- s".format(id)
             }
@@ -258,7 +353,7 @@ fun EspDataScreen(viewModel: MainViewModel) {
 
         Text(connectionState, fontSize = 16.sp)
         Spacer(Modifier.height(8.dp))
-        Button(onClick = { viewModel.startScan(context) }) {
+        Button(onClick = onStartScan) {
             Text("Start Scan")
         }
     }
@@ -268,7 +363,12 @@ fun EspDataScreen(viewModel: MainViewModel) {
 @Composable
 fun DefaultPreview() {
     ShowVoltTheme {
-        EspDataScreen(MainViewModel())
+        val previewState = mapOf(1 to DeviceState(lastAverageVoltage = 11.04f, lastSessionDuration = 2.5f))
+        EspDataScreenContent(
+            espDevices = previewState,
+            connectionState = "Preview Disconnected",
+            onStartScan = {}
+        )
     }
 }
 
