@@ -114,8 +114,11 @@ class MainViewModel : ViewModel() {
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var bleScanner: BluetoothLeScanner? = null
+    private var applicationContext: Context? = null
+
 
     fun startScan(context: Context) {
+        applicationContext = context.applicationContext
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val bluetoothAdapter = bluetoothManager.adapter
         bleScanner = bluetoothAdapter.bluetoothLeScanner
@@ -140,13 +143,18 @@ class MainViewModel : ViewModel() {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             _connectionState.value = "Device Found, Connecting..."
-            result.device.connectGatt(null, false, gattCallback)
-            // Stop scanning once the device is found
+            applicationContext?.let {
+                result.device.connectGatt(it, false, gattCallback)
+            } ?: run {
+                 _connectionState.value = "Error: Context not available"
+                 Log.e("BLE", "Cannot connect, context is null")
+            }
             bleScanner?.stopScan(this)
         }
 
         override fun onScanFailed(errorCode: Int) {
             _connectionState.value = "Scan Failed: Code $errorCode"
+            Log.e("BLE", "Scan Failed with code: $errorCode")
         }
     }
 
@@ -167,6 +175,7 @@ class MainViewModel : ViewModel() {
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d("BLE", "Services Discovered")
                 val service = gatt.getService(SERVICE_UUID)
                 val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
                 if (characteristic != null) {
@@ -174,15 +183,21 @@ class MainViewModel : ViewModel() {
                     val descriptor = characteristic.getDescriptor(CCCD_UUID)
                     descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     gatt.writeDescriptor(descriptor)
-                    viewModelScope.launch { _connectionState.value = "Listening for data..." }
+                    Log.d("BLE", "Enabling notifications...")
+                } else {
+                     Log.e("BLE", "Characteristic not found")
                 }
+            } else {
+                Log.w("BLE", "onServicesDiscovered received: $status")
             }
         }
 
-        @Deprecated("Used for older API levels")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                onCharacteristicChanged(gatt, characteristic, characteristic.value)
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                 Log.d("BLE", "Descriptor write successful. Now listening for data.")
+                 viewModelScope.launch { _connectionState.value = "Listening for data..." }
+            } else {
+                 Log.e("BLE", "Descriptor write failed: $status")
             }
         }
 
@@ -193,12 +208,22 @@ class MainViewModel : ViewModel() {
                 onDataReceived(dataString)
             }
         }
+        
+        @Deprecated("Used for older API levels")
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                onCharacteristicChanged(gatt, characteristic, characteristic.value)
+            }
+        }
     }
 
     private fun onDataReceived(data: String) {
         // "ID=1,VIN=11.2,TIME=123.4"
         try {
-            val parts = data.split(",").associate { val (k, v) = it.split("="); k to v }
+            val parts = data.split(",").associate { 
+                val pair = it.split("=")
+                if (pair.size == 2) pair[0] to pair[1] else pair[0] to ""
+            }
             val id = parts["ID"]?.toIntOrNull()
             val vin = parts["VIN"]?.toFloatOrNull()
             val time = parts["TIME"]?.toFloatOrNull()
@@ -209,6 +234,8 @@ class MainViewModel : ViewModel() {
                         this[id] = EspDeviceState(vin, time)
                     }
                 }
+            } else {
+                 Log.e("BLE", "Parsed data contains null values. Raw: $data")
             }
         } catch (e: Exception) {
             Log.e("BLE", "Failed to parse data: $data", e)
@@ -217,8 +244,6 @@ class MainViewModel : ViewModel() {
 
     fun disconnectAndClose() {
         bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
-        bluetoothGatt = null
     }
 
     override fun onCleared() {
