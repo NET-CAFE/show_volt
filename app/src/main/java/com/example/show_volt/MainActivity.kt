@@ -49,7 +49,7 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 
 // Constants from your ESP32 code
-private const val TARGET_DEVICE_NAME = "ESP32_BLE_SERVER"
+private const val TARGET_DEVICE_NAME = "ESP32_CENTRAL_GATEWAY"
 private val SERVICE_UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
 private val CHARACTERISTIC_UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
 private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") // Client Characteristic Configuration Descriptor
@@ -102,14 +102,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Data class to hold the state and results for each device
+// Simplified DeviceState: only holds the final results sent from the ESP32 network.
 data class DeviceState(
-    // State for an ongoing session
-    val isSessionActive: Boolean = false,
-    val sessionStartTime: Long = 0L,
-    val voltageReadings: List<Float> = emptyList(),
-
-    // Results of the last completed session
     val lastAverageVoltage: Float = 0f,
     val lastSessionDuration: Float = 0f
 )
@@ -230,75 +224,25 @@ class MainViewModel : ViewModel() {
 
     private fun onDataReceived(data: String) {
         try {
-            val parts = data.split(",").associate {
-                val pair = it.split("=")
-                if (pair.size == 2) pair[0] to pair[1] else pair[0] to ""
-            }
+            // New format from ESP32 Gateway: "ID:5,V:12.45,T:3.20"
+            val parts = data.split(",").map { it.split(":") }.associate { it[0] to it[1] }
+            
             val id = parts["ID"]?.toIntOrNull()
-            val vin = parts["VIN"]?.toFloatOrNull()
+            val voltage = parts["V"]?.toFloatOrNull()
+            val duration = parts["T"]?.toFloatOrNull()
 
-            if (id != null && vin != null) {
-                // Use the atomic `update` function to prevent race conditions
-                // when data from multiple devices arrives concurrently.
+            if (id != null && voltage != null && duration != null) {
                 _espDevices.update { currentDevices ->
-                    val currentState = currentDevices[id] ?: DeviceState()
-                    val newState = processDeviceUpdate(currentState, vin)
+                    val newState = DeviceState(
+                        lastAverageVoltage = voltage,
+                        lastSessionDuration = duration
+                    )
                     // Return the new map with the updated state for the device.
                     currentDevices + (id to newState)
                 }
             }
         } catch (e: Exception) {
-            Log.e("BLE", "Failed to parse data: $data", e)
-        }
-    }
-
-    private fun processDeviceUpdate(currentState: DeviceState, newVoltage: Float): DeviceState {
-        val VOLTAGE_THRESHOLD = 0.5f
-
-        // Case 1: Voltage is high (session is starting or ongoing)
-        if (newVoltage >= VOLTAGE_THRESHOLD) {
-            return if (!currentState.isSessionActive) {
-                // Session is starting now
-                currentState.copy(
-                    isSessionActive = true,
-                    sessionStartTime = System.currentTimeMillis(),
-                    voltageReadings = listOf(newVoltage)
-                )
-            } else {
-                // Session is ongoing, add new voltage reading
-                currentState.copy(
-                    voltageReadings = currentState.voltageReadings + newVoltage
-                )
-            }
-        }
-        // Case 2: Voltage is low (session is ending or already ended)
-        else {
-            return if (currentState.isSessionActive) {
-                // Session was active, so it's ending now. Time to calculate.
-                val durationMillis = System.currentTimeMillis() - currentState.sessionStartTime
-                val averageVoltage = if (currentState.voltageReadings.isNotEmpty()) {
-                    val readings = currentState.voltageReadings
-                    // If there are 3 or more readings, discard the first and last ones.
-                    if (readings.size >= 3) {
-                        readings.drop(1).dropLast(1).average().toFloat()
-                    } else {
-                        // Otherwise, average all available readings.
-                        readings.average().toFloat()
-                    }
-                } else {
-                    0f // No readings in the session.
-                }
-                // Return a new state representing the completed session
-                currentState.copy(
-                    isSessionActive = false,
-                    lastAverageVoltage = averageVoltage,
-                    lastSessionDuration = durationMillis / 1000.0f,
-                    voltageReadings = emptyList() // Clear readings for next session
-                )
-            } else {
-                // Session was already ended, no change needed
-                currentState
-            }
+            Log.e("BLE", "Failed to parse new data format: $data", e)
         }
     }
 
@@ -343,7 +287,8 @@ fun EspDataScreenContent(
 
         (1..5).forEach { id ->
             val deviceState = espDevices[id]
-            val text = if (deviceState != null && deviceState.lastAverageVoltage > 0) {
+            // Updated format to match the incoming data (V and T)
+            val text = if (deviceState != null) {
                 "ESP-%d: %.2f V, %.2f s".format(id, deviceState.lastAverageVoltage, deviceState.lastSessionDuration)
             } else {
                 "ESP-%d: -- V, -- s".format(id)
