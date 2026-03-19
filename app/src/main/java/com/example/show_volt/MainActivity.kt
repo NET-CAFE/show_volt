@@ -46,6 +46,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.Locale
 import java.util.UUID
 
 // Constants from your ESP32 code
@@ -104,8 +105,8 @@ class MainActivity : ComponentActivity() {
 
 // Simplified DeviceState: only holds the final results sent from the ESP32 network.
 data class DeviceState(
-    val lastAverageVoltage: Float = 0f,
-    val lastSessionDuration: Float = 0f
+    val lastAverageVoltage: Double = 0.0,
+    val lastSessionDuration: Double = 0.0
 )
 
 
@@ -167,15 +168,24 @@ class MainViewModel : ViewModel() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             viewModelScope.launch {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    _connectionState.value = "Connected, Discovering Services..."
+                    _connectionState.value = "Connected, Requesting MTU..."
                     bluetoothGatt = gatt
-                    gatt.discoverServices()
+                    // Request MTU before discovering services
+                    gatt.requestMtu(512)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     _connectionState.value = "Disconnected"
                     bluetoothGatt?.close()
                     bluetoothGatt = null
                 }
             }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d("BLE", "MTU changed to: $mtu")
+            }
+            // Always discover services after MTU request
+            gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -208,7 +218,7 @@ class MainViewModel : ViewModel() {
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             if (characteristic.uuid == CHARACTERISTIC_UUID) {
-                val dataString = String(value, Charsets.UTF_8)
+                val dataString = String(value, Charsets.UTF_8).replace("\u0000", "").trim()
                 Log.d("BLE", "Received: $dataString")
                 onDataReceived(dataString)
             }
@@ -225,11 +235,14 @@ class MainViewModel : ViewModel() {
     private fun onDataReceived(data: String) {
         try {
             // New format from ESP32 Gateway: "ID:5,V:12.45,T:3.20"
-            val parts = data.split(",").map { it.split(":") }.associate { it[0] to it[1] }
+            val parts = data.split(",").associate {
+                val kv = it.split(":")
+                kv[0].trim() to kv[1].trim()
+            }
             
             val id = parts["ID"]?.toIntOrNull()
-            val voltage = parts["V"]?.toFloatOrNull()
-            val duration = parts["T"]?.toFloatOrNull()
+            val voltage = parts["V"]?.toDoubleOrNull()
+            val duration = parts["T"]?.toDoubleOrNull()
 
             if (id != null && voltage != null && duration != null) {
                 _espDevices.update { currentDevices ->
@@ -242,7 +255,7 @@ class MainViewModel : ViewModel() {
                 }
             }
         } catch (e: Exception) {
-            Log.e("BLE", "Failed to parse new data format: $data", e)
+            Log.e("BLE", "Failed to parse data: $data", e)
         }
     }
 
@@ -287,9 +300,9 @@ fun EspDataScreenContent(
 
         (1..5).forEach { id ->
             val deviceState = espDevices[id]
-            // Updated format to match the incoming data (V and T)
             val text = if (deviceState != null) {
-                "ESP-%d: %.2f V, %.2f s".format(id, deviceState.lastAverageVoltage, deviceState.lastSessionDuration)
+                String.format(Locale.US, "ESP-%d: %.4f V, %.4f s", 
+                    id, deviceState.lastAverageVoltage, deviceState.lastSessionDuration)
             } else {
                 "ESP-%d: -- V, -- s".format(id)
             }
@@ -311,7 +324,7 @@ fun EspDataScreenContent(
 @Composable
 fun DefaultPreview() {
     ShowVoltTheme {
-        val previewState = mapOf(1 to DeviceState(lastAverageVoltage = 11.04f, lastSessionDuration = 2.5f))
+        val previewState = mapOf(1 to DeviceState(lastAverageVoltage = 11.0456, lastSessionDuration = 2.5123))
         EspDataScreenContent(
             espDevices = previewState,
             connectionState = "Preview Disconnected",
