@@ -23,6 +23,7 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -232,19 +233,20 @@ class MainViewModel : ViewModel() {
                 val relEnd = (eventEndTime - firstEventReferenceTimeMillis!!) / 1000.0
 
                 _relayHistory.update { history ->
-                    // Tính toán trùng chập dựa trên thời gian tuyệt đối
+                    // Tính toán trùng chập dựa trên thời gian tuyệt đối, loại bỏ chính ESP đó
+                    val newEndSec = currentTime / 1000.0
+                    val newStartSec = newEndSec - duration
+
                     val overlaps = history.filter { old ->
+                        if (old.id == id) return@filter false
+                        
                         val oldEnd = old.arrivalTimeMillis / 1000.0
                         val oldStart = oldEnd - old.duration
-                        val newEndSec = currentTime / 1000.0
-                        val newStartSec = newEndSec - duration
                         val overlapAmount = max(0.0, min(newEndSec, oldEnd) - max(newStartSec, oldStart))
                         overlapAmount > 0.01 
                     }.map { old ->
                         val oldEnd = old.arrivalTimeMillis / 1000.0
                         val oldStart = oldEnd - old.duration
-                        val newEndSec = currentTime / 1000.0
-                        val newStartSec = newEndSec - duration
                         val overlapAmount = max(0.0, min(newEndSec, oldEnd) - max(newStartSec, oldStart))
                         OverlapDetail(old.id, overlapAmount)
                     }
@@ -309,7 +311,8 @@ fun EspDataContent(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                     colors = CardDefaults.cardColors(
                         containerColor = if (res.overlaps.isNotEmpty()) Color(0xFFFFEBEE) else MaterialTheme.colorScheme.surfaceVariant
-                    )
+                    ),
+                    border = BorderStroke(1.dp, if (res.overlaps.isNotEmpty()) Color.Red else Color.Transparent)
                 ) {
                     Column(Modifier.padding(12.dp)) {
                         Row(
