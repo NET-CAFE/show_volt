@@ -38,6 +38,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -372,7 +373,7 @@ fun EspDataContent(
                         if (res.overlaps.isNotEmpty()) {
                             res.overlaps.forEach { overlap ->
                                 Text(
-                                    "-> Trùng với ESP-${overlap.id}: %.3fs".format(Locale.US, overlap.duration),
+                                    "-> Trùng with ESP-${overlap.id}: %.3fs".format(Locale.US, overlap.duration),
                                     color = Color.Red,
                                     fontSize = 11.sp
                                 )
@@ -410,12 +411,11 @@ fun PulseChart(history: List<DeviceResult>, modifier: Modifier = Modifier) {
     val displayDuration = displayMaxX - displayMinX
 
     // Tính toán dải điện áp (Trục tung)
-    // Cố định vùng hiển thị lên đến ít nhất 12V để xung 11V trông đẹp và nhãn không bị che
     val maxVoltData = history.maxOfOrNull { it.voltage } ?: 0.0
     val displayMaxY = maxOf(maxVoltData * 1.3, 14.0)
 
     Card(
-        modifier = modifier.fillMaxWidth().height(250.dp),
+        modifier = modifier.fillMaxWidth().height(280.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         border = BorderStroke(1.dp, Color.LightGray)
@@ -428,7 +428,7 @@ fun PulseChart(history: List<DeviceResult>, modifier: Modifier = Modifier) {
                 val width = size.width
                 val height = size.height
                 val labelHeight = 20.dp.toPx()
-                val bottomAxisHeight = 20.dp.toPx()
+                val bottomAxisHeight = 45.dp.toPx() // Tăng không gian để vẽ text nghiêng
                 val leftAxisWidth = 35.dp.toPx()
                 
                 val chartWidth = width - leftAxisWidth
@@ -437,9 +437,7 @@ fun PulseChart(history: List<DeviceResult>, modifier: Modifier = Modifier) {
                 val baselineY = height - bottomAxisHeight
 
                 // 1. Vẽ trục tọa độ
-                // Trục tung (Voltage)
                 drawLine(Color.Gray, Offset(leftAxisWidth, labelHeight), Offset(leftAxisWidth, baselineY), strokeWidth = 2f)
-                // Trục hoành (Time)
                 drawLine(Color.Gray, Offset(leftAxisWidth, baselineY), Offset(width, baselineY), strokeWidth = 2f)
 
                 // 2. Vẽ các vạch chia điện áp (0V, 5V, 10V)
@@ -488,14 +486,29 @@ fun PulseChart(history: List<DeviceResult>, modifier: Modifier = Modifier) {
                         topLeft = Offset(startX + (pulseWidth - textLayoutResult.size.width) / 2, topY - textLayoutResult.size.height - 4f),
                         color = Color.DarkGray
                     )
+
+                    // 5. Vẽ thời gian bắt đầu (relativeStart) nghiêng 45 độ ở dưới trục hoành
+                    val startTimeText = "%.3fs".format(Locale.US, res.relativeStart)
+                    val startTimeLayout = textMeasurer.measure(startTimeText, style = TextStyle(fontSize = 9.sp))
+                    
+                    val textPivotX = startX
+                    val textPivotY = baselineY + 5.dp.toPx()
+                    
+                    rotate(degrees = 45f, pivot = Offset(textPivotX, textPivotY)) {
+                        drawText(
+                            textLayoutResult = startTimeLayout,
+                            topLeft = Offset(textPivotX, textPivotY),
+                            color = Color.Gray
+                        )
+                    }
                 }
                 
-                // Nhãn trục hoành (Time)
+                // Nhãn trục hoành (Time) đưa ra ngoài cùng bên phải, sát đáy canvas để tránh chồng lấn
+                val timeLabelText = "Time (s)"
+                val timeLayout = textMeasurer.measure(timeLabelText, style = TextStyle(fontSize = 10.sp, color = Color.Gray))
                 drawText(
-                    textMeasurer = textMeasurer,
-                    text = "Time (s)",
-                    topLeft = Offset(width - 50.dp.toPx(), baselineY + 4f),
-                    style = TextStyle(fontSize = 10.sp, color = Color.Gray)
+                    textLayoutResult = timeLayout,
+                    topLeft = Offset(width - timeLayout.size.width, height - timeLayout.size.height),
                 )
             }
         }
@@ -511,10 +524,10 @@ fun EspDataScreenPreview() {
     ShowVoltTheme {
         val sampleHistory = listOf(
             DeviceResult(1, 11.0, 1.0, 1000L, emptyList(), 0.0, 1.0),
-            DeviceResult(2, 5.0, 1.0, 2500L, emptyList(), 1.5, 2.5),
-            DeviceResult(3, 10.5, 1.0, 4500L, emptyList(), 3.5, 4.5),
-            DeviceResult(4, 3.1, 1.0, 6500L, emptyList(), 5.5, 6.5),
-            DeviceResult(5, 11.2, 1.0, 8500L, emptyList(), 7.5, 8.5)
+            DeviceResult(2, 5.0, 1.2, 2500L, emptyList(), 1.5, 2.7),
+            DeviceResult(3, 10.5, 0.8, 4500L, emptyList(), 3.5, 4.3),
+            DeviceResult(4, 3.1, 1.5, 6500L, emptyList(), 5.5, 7.0),
+            DeviceResult(5, 11.2, 0.9, 8500L, emptyList(), 7.5, 8.4)
         )
         EspDataContent(
             relayHistory = sampleHistory,
