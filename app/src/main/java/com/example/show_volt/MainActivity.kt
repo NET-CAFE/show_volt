@@ -24,6 +24,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -33,9 +34,15 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -43,6 +50,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -121,13 +130,19 @@ class MainViewModel : ViewModel() {
     private val _connectionState = MutableStateFlow("Disconnected")
     val connectionState = _connectionState.asStateFlow()
 
+    private val _showPulseChart = MutableStateFlow(false)
+    val showPulseChart = _showPulseChart.asStateFlow()
+
     private var firstEventReferenceTimeMillis: Long? = null
     private var bluetoothGatt: BluetoothGatt? = null
     private var bleScanner: BluetoothLeScanner? = null
+    private var chartTimerJob: Job? = null
 
     fun resetResults() {
         _relayHistory.value = emptyList()
         firstEventReferenceTimeMillis = null
+        _showPulseChart.value = false
+        chartTimerJob?.cancel()
     }
 
     fun startScan(context: Context) {
@@ -233,13 +248,11 @@ class MainViewModel : ViewModel() {
                 val relEnd = (eventEndTime - firstEventReferenceTimeMillis!!) / 1000.0
 
                 _relayHistory.update { history ->
-                    // Tính toán trùng chập dựa trên thời gian tuyệt đối, loại bỏ chính ESP đó
                     val newEndSec = currentTime / 1000.0
                     val newStartSec = newEndSec - duration
 
                     val overlaps = history.filter { old ->
                         if (old.id == id) return@filter false
-                        
                         val oldEnd = old.arrivalTimeMillis / 1000.0
                         val oldStart = oldEnd - old.duration
                         val overlapAmount = max(0.0, min(newEndSec, oldEnd) - max(newStartSec, oldStart))
@@ -262,6 +275,17 @@ class MainViewModel : ViewModel() {
                     )
                     (history + result).takeLast(100)
                 }
+
+                // Logic vẽ biểu đồ: Reset timer mỗi khi có data mới
+                _showPulseChart.value = false
+                chartTimerJob?.cancel()
+                chartTimerJob = viewModelScope.launch {
+                    delay(10000) // Đợi 10 giây không có tín hiệu mới
+                    val currentHistory = _relayHistory.value
+                    if (currentHistory.isNotEmpty() && currentHistory.none { it.overlaps.isNotEmpty() }) {
+                        _showPulseChart.value = true
+                    }
+                }
             }
         } catch (e: Exception) { 
             Log.e("BLE_DATA", "Parse Error: $data")
@@ -275,11 +299,13 @@ class MainViewModel : ViewModel() {
 fun EspDataScreen(viewModel: MainViewModel) {
     val relayHistory by viewModel.relayHistory.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val showPulseChart by viewModel.showPulseChart.collectAsState()
     val context = LocalContext.current
 
     EspDataContent(
         relayHistory = relayHistory,
         connectionState = connectionState,
+        showPulseChart = showPulseChart,
         onStartScan = { viewModel.startScan(context) },
         onResetResults = { viewModel.resetResults() }
     )
@@ -289,6 +315,7 @@ fun EspDataScreen(viewModel: MainViewModel) {
 fun EspDataContent(
     relayHistory: List<DeviceResult>,
     connectionState: String,
+    showPulseChart: Boolean,
     onStartScan: () -> Unit,
     onResetResults: () -> Unit,
     modifier: Modifier = Modifier
@@ -300,12 +327,16 @@ fun EspDataContent(
         
         Spacer(Modifier.height(16.dp))
 
+        if (showPulseChart) {
+            PulseChart(relayHistory)
+            Spacer(Modifier.height(16.dp))
+        }
+
         // PHẦN TRÊN: DANH SÁCH THỨ TỰ CÓ ĐIỆN (Sequence of Events)
         Text("Trình tự có điện (Common Clock)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
         Divider(Modifier.padding(vertical = 8.dp))
         
         LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
-            // Hiển thị tất cả sự kiện theo thứ tự xuất hiện (ai có trước đứng trước)
             items(relayHistory) { res ->
                 Card(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -328,7 +359,6 @@ fun EspDataContent(
                             }
                         }
                         Spacer(Modifier.height(4.dp))
-                        // Hiển thị thời gian Bắt đầu - Kết thúc theo đồng hồ chung
                         Text(
                             text = "Thời gian: %.3f - %.3f (s)".format(Locale.US, res.relativeStart, res.relativeEnd),
                             fontSize = 15.sp,
@@ -355,39 +385,119 @@ fun EspDataContent(
 
         Spacer(Modifier.height(16.dp))
 
-        // PHẦN DƯỚI: LỊCH SỬ TRÙNG (Tóm tắt nhanh)
-        Text("Lịch sử trùng gần đây", fontWeight = FontWeight.Bold, color = Color.Red)
-        Divider(Modifier.padding(vertical = 4.dp))
-        
-        LazyRow(
-            modifier = Modifier.fillMaxWidth().height(80.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            val collisions = relayHistory.filter { it.overlaps.isNotEmpty() }.reversed()
-            if (collisions.isEmpty()) {
-                item {
-                    Text("Chưa có trùng chập", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 8.dp))
-                }
-            }
-            items(collisions) { res ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
-                    modifier = Modifier.width(150.dp).fillMaxHeight()
-                ) {
-                    Column(Modifier.padding(8.dp)) {
-                        Text("ESP-${res.id}", fontWeight = FontWeight.Bold, color = Color.Red, fontSize = 12.sp)
-                        Text("%.3f - %.3f s".format(Locale.US, res.relativeStart, res.relativeEnd), fontSize = 10.sp)
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
         // CÁC NÚT BẤM
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             Button(onClick = onStartScan) { Text("Start Scan") }
             OutlinedButton(onClick = onResetResults) { Text("Clear All") }
+        }
+    }
+}
+
+@Composable
+fun PulseChart(history: List<DeviceResult>, modifier: Modifier = Modifier) {
+    if (history.isEmpty()) return
+    
+    val textMeasurer = rememberTextMeasurer()
+    
+    // Tính toán dải thời gian hiển thị (Trục hoành)
+    val minStart = history.minOf { it.relativeStart }
+    val maxEnd = history.maxOf { it.relativeEnd }
+    val totalTime = max(1.0, maxEnd - minStart)
+    
+    val paddingX = totalTime * 0.1 // 10% padding ngang
+    val displayMinX = minStart - paddingX
+    val displayMaxX = maxEnd + paddingX
+    val displayDuration = displayMaxX - displayMinX
+
+    // Tính toán dải điện áp (Trục tung)
+    // Cố định vùng hiển thị lên đến ít nhất 12V để xung 11V trông đẹp và nhãn không bị che
+    val maxVoltData = history.maxOfOrNull { it.voltage } ?: 0.0
+    val displayMaxY = maxOf(maxVoltData * 1.3, 14.0)
+
+    Card(
+        modifier = modifier.fillMaxWidth().height(250.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = BorderStroke(1.dp, Color.LightGray)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Biểu đồ xung điện áp (Voltage vs Time)", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(12.dp))
+            
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val width = size.width
+                val height = size.height
+                val labelHeight = 20.dp.toPx()
+                val bottomAxisHeight = 20.dp.toPx()
+                val leftAxisWidth = 35.dp.toPx()
+                
+                val chartWidth = width - leftAxisWidth
+                val chartHeight = height - bottomAxisHeight - labelHeight
+                
+                val baselineY = height - bottomAxisHeight
+
+                // 1. Vẽ trục tọa độ
+                // Trục tung (Voltage)
+                drawLine(Color.Gray, Offset(leftAxisWidth, labelHeight), Offset(leftAxisWidth, baselineY), strokeWidth = 2f)
+                // Trục hoành (Time)
+                drawLine(Color.Gray, Offset(leftAxisWidth, baselineY), Offset(width, baselineY), strokeWidth = 2f)
+
+                // 2. Vẽ các vạch chia điện áp (0V, 5V, 10V)
+                val voltTicks = listOf(0.0, 5.0, 10.0)
+                voltTicks.forEach { v ->
+                    val y = baselineY - (v / displayMaxY).toFloat() * chartHeight
+                    drawLine(Color(0xFFEEEEEE), Offset(leftAxisWidth, y), Offset(width, y), strokeWidth = 1f)
+                    
+                    drawText(
+                        textMeasurer = textMeasurer,
+                        text = "${v.toInt()}V",
+                        topLeft = Offset(5.dp.toPx(), y - 7.dp.toPx()),
+                        style = TextStyle(fontSize = 10.sp, color = Color.Gray)
+                    )
+                }
+
+                // 3. Vẽ các xung
+                history.forEach { res ->
+                    val startX = leftAxisWidth + ((res.relativeStart - displayMinX) / displayDuration).toFloat() * chartWidth
+                    val endX = leftAxisWidth + ((res.relativeEnd - displayMinX) / displayDuration).toFloat() * chartWidth
+                    val pulseWidth = max(4f, endX - startX)
+                    
+                    val pulseHeight = (res.voltage / displayMaxY).toFloat() * chartHeight
+                    val topY = baselineY - pulseHeight
+
+                    // Vẽ thân xung (Hình chữ nhật)
+                    drawRect(
+                        color = Color(0xFF2196F3).copy(alpha = 0.7f),
+                        topLeft = Offset(startX, topY),
+                        size = Size(pulseWidth, pulseHeight)
+                    )
+                    
+                    // Vẽ viền xung
+                    drawRect(
+                        color = Color(0xFF1976D2),
+                        topLeft = Offset(startX, topY),
+                        size = Size(pulseWidth, pulseHeight),
+                        style = Stroke(width = 2f)
+                    )
+
+                    // 4. Vẽ tên ESP trên đầu mỗi xung
+                    val labelText = "ESP-${res.id}"
+                    val textLayoutResult = textMeasurer.measure(labelText, style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Bold))
+                    drawText(
+                        textLayoutResult = textLayoutResult,
+                        topLeft = Offset(startX + (pulseWidth - textLayoutResult.size.width) / 2, topY - textLayoutResult.size.height - 4f),
+                        color = Color.DarkGray
+                    )
+                }
+                
+                // Nhãn trục hoành (Time)
+                drawText(
+                    textMeasurer = textMeasurer,
+                    text = "Time (s)",
+                    topLeft = Offset(width - 50.dp.toPx(), baselineY + 4f),
+                    style = TextStyle(fontSize = 10.sp, color = Color.Gray)
+                )
+            }
         }
     }
 }
@@ -400,13 +510,16 @@ fun ShowVoltTheme(content: @Composable () -> Unit) { MaterialTheme { content() }
 fun EspDataScreenPreview() {
     ShowVoltTheme {
         val sampleHistory = listOf(
-            DeviceResult(1, 3.3210, 1.0, System.currentTimeMillis() - 4000, emptyList(), 0.0, 1.0),
-            DeviceResult(2, 3.2890, 1.0, System.currentTimeMillis() - 1000, emptyList(), 3.0, 4.0),
-            DeviceResult(3, 3.3000, 0.5, System.currentTimeMillis(), listOf(OverlapDetail(2, 0.1)), 3.9, 4.4)
+            DeviceResult(1, 11.0, 1.0, 1000L, emptyList(), 0.0, 1.0),
+            DeviceResult(2, 5.0, 1.0, 2500L, emptyList(), 1.5, 2.5),
+            DeviceResult(3, 10.5, 1.0, 4500L, emptyList(), 3.5, 4.5),
+            DeviceResult(4, 3.1, 1.0, 6500L, emptyList(), 5.5, 6.5),
+            DeviceResult(5, 11.2, 1.0, 8500L, emptyList(), 7.5, 8.5)
         )
         EspDataContent(
             relayHistory = sampleHistory,
             connectionState = "Connected",
+            showPulseChart = true,
             onStartScan = {},
             onResetResults = {}
         )
